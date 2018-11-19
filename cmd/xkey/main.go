@@ -29,6 +29,7 @@ var (
 	txFromFile    bool
 	customKeyFile bool
 	eip155        bool
+	extended      bool
 )
 
 func main() {
@@ -38,9 +39,12 @@ func main() {
 			help()
 			return
 		}
-		if strings.Contains(flags, "i") {
-			ImportBrainWallet()
+		if strings.Contains(flags, "?") {
+			help()
 			return
+		}
+		if strings.Contains(flags, "x") {
+			extended = true
 		}
 		if strings.Contains(flags, "n") {
 			eip155 = true
@@ -51,14 +55,20 @@ func main() {
 		if strings.Contains(flags, "k") {
 			customKeyFile = true
 		}
+		if strings.Contains(flags, "i") {
+			ImportBrainWallet()
+			return
+		}
 	}
 	run(os.Args)
 }
 
 func help() {
+	fmt.Println("xkey v.0.3")
 	fmt.Println("USAGE: xkey [flags] [txfile] [keyfile]")
 	fmt.Println("Flags:")
 	fmt.Println("\t h - help")
+	fmt.Println("\t x - extended input")
 	fmt.Println("\t i - import brain wallet")
 	fmt.Println("\t n - use network id")
 	fmt.Println("\t t - tx from file")
@@ -67,19 +77,44 @@ func help() {
 }
 
 func secureInputWithConfirmations(confirmations int) []byte {
-	s := terminal.SecureInput()
+	s := terminal.SecureInput(extended)
 	for i := 0; i < confirmations; i++ {
 		fmt.Println("Please confirm")
-		x := terminal.SecureInput()
+		x := terminal.SecureInput(extended)
 		if !bytes.Equal(s, x) {
 			fmt.Printf("Failed confirmation #%d. Let's try again from scratch.\n", i)
+			return nil
 		}
 	}
 	return s
 }
 
+//func bip39toKey(confirmations int) keystore.Key {
+//	var brainwallet []byte
+//	for brainwallet == nil {
+//		brainwallet = secureInputWithConfirmations(0)
+//	}
+//	hash := crutils.Sha2(brainwallet)
+//	privateKey, err := crypto.ToECDSA(hash)
+//	if err != nil {
+//		utils.Fatalf("brain wallet derivation error: %v", err)
+//	}
+//
+//	id := uuid.NewRandom()
+//	key := &keystore.Key{
+//		Id:         id,
+//		Address:    crypto.PubkeyToAddress(privateKey.PublicKey),
+//		PrivateKey: privateKey,
+//	}
+//
+//	return key
+//}
+
 func ImportBrainWallet() {
-	brainwallet := secureInputWithConfirmations(2)
+	var brainwallet []byte
+	for brainwallet == nil {
+		brainwallet = secureInputWithConfirmations(0)
+	}
 	hash := crutils.Sha2(brainwallet)
 	privateKey, err := crypto.ToECDSA(hash)
 	if err != nil {
@@ -94,19 +129,35 @@ func ImportBrainWallet() {
 	}
 
 	fmt.Println("Please enter the password for key encryption")
-	pass := secureInputWithConfirmations(1)
-	keyjson, err := keystore.EncryptKey(key, pass, keystore.StandardScryptN, keystore.StandardScryptP)
+	var pass []byte
+	for pass == nil {
+		pass = secureInputWithConfirmations(0)
+	}
+
+	keyjson, err := keystore.EncryptKey(key, string(pass), keystore.StandardScryptN, keystore.StandardScryptP)
 	if err != nil {
 		utils.Fatalf("Error encrypting key: %v", err)
 	}
 
 	// store the file to disk
-	name := fmt.Sprintf("%x", key.Address)
-	if err := ioutil.WriteFile(name, keyjson, 0770); err != nil {
-		utils.Fatalf("Failed to write keyfile to %s: %v", name, err)
+	rnd := make([]byte, 16)
+	err = crutils.StochasticRand(rnd)
+	if err != nil {
+		utils.Fatalf("Failed to generate random data: %s", err)
 	}
 
-	fmt.Println("new address:", name)
+	name := fmt.Sprintf("./tmp/%x-%x", key.Address, rnd)
+	_, err = os.Stat(name)
+	if !os.IsNotExist(err) {
+		utils.Fatalf("Unexpected error: file [%s] already exist", name)
+	}
+
+	if err := ioutil.WriteFile(name, keyjson, 0770); err != nil {
+		utils.Fatalf("Failed to write keyfile to [%s]: %v", name, err)
+	}
+
+	fmt.Printf("new address: %x \n", key.Address)
+	fmt.Println("key file: ", name)
 }
 
 func findFileByAddress(src common.Address) string {
@@ -128,7 +179,7 @@ func findFileByAddress(src common.Address) string {
 	}
 
 	fmt.Println("key file not found, please enter file name:")
-	name := terminal.StandardInput()
+	name := terminal.PlainTextInput()
 	if len(name) == 0 {
 		utils.Fatalf("key file is missing")
 	}
@@ -151,7 +202,7 @@ func createTransaction(args *ethapi.SendTxArgs) *types.Transaction {
 
 func requestTransaction() *ethapi.SendTxArgs {
 	fmt.Println("Please enter tx for signing:")
-	ts := terminal.StandardInput()
+	ts := terminal.PlainTextInput()
 
 	var txArgs ethapi.SendTxArgs
 	if err := json.Unmarshal([]byte(ts), &txArgs); err != nil {
@@ -165,7 +216,7 @@ func requestTransaction() *ethapi.SendTxArgs {
 
 func getPassword(secure bool) string {
 	if secure {
-		p := terminal.SecureInput()
+		p := terminal.SecureInput(extended)
 		return string(p)
 	}
 	pass, err := console.Stdin.PromptPassword("Please enter password: ")
