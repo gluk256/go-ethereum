@@ -463,7 +463,7 @@ func (p *Pss) process(pssmsg *PssMsg, raw bool, prox bool) error {
 		payload = recvmsg.Payload
 	}
 
-	if len(pssmsg.To) < addressLength {
+	if len(pssmsg.To) < addressLength || prox {
 		if err := p.enqueue(pssmsg); err != nil {
 			return err
 		}

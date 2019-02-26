@@ -1,6 +1,5 @@
 package pss
 
-/*
 import (
 	"context"
 	"encoding/binary"
@@ -34,7 +33,23 @@ import (
 var (
 	runNodes      = flag.Int("nodes", 0, "nodes to start in the network")
 	runMessages   = flag.Int("messages", 0, "messages to send during test")
-	//stableTimeout = flag.Int("timeout.stable", 10, "timeout in seconds for network to stabilize")
+
+	topic = BytesToTopic([]byte{0x00, 0x00, 0x06, 0x82})
+	handlerC = make(chan handlerNotification) // passes message from pss message handler to simulation driver
+	handlerDone bool // set to true on termination of the simulation run
+	mu = &sync.Mutex{} // keeps handlerDonc in sync
+	kademlias = make(map[enode.ID]*network.Kademlia)
+	nodeAddrs = make(map[enode.ID][]byte) // make predictable overlay addresses from the generated random enode ids
+	msgsToReceive int // total count of messages to receive, used for terminating the simulation run
+	recipients = make(map[int][]enode.ID) // for logging output only
+	msgs [][]byte // recipient addresses of messages
+	expectedMsgs = make(map[enode.ID][]uint64) // message serials we expect respective nodes to receive
+	senders = make(map[int]enode.ID) // originating nodes of the messages (intention is to choose as far as possible from the receiving neighborhood)
+	pof = pot.DefaultPof(256) // generate messages and index them
+	sim *simulation.Simulation
+	doneC = make(chan struct{}) // terminates the handler channel listener
+	errC = make(chan error) // error to pass to main sim thread
+	msgC = make(chan handlerNotification) // message receipt notification to main sim thread
 )
 
 // needed to make the enode id of the receiving node available to the handler for triggers
@@ -53,24 +68,29 @@ func init() {
 	log.Root().SetHandler(log.LvlFilterHandler(log.LvlTrace, log.StreamHandler(os.Stderr, log.TerminalFormat(true))))
 }
 
-func TestProxNetwork(t *testing.T) {
-	if (*runNodes > 0 && *runMessages == 0) || (*runMessages > 0 && *runNodes == 0) {
-		log.Crit("cannot specify only one of flags --nodes and --messages")
-	}
-
-	if *runNodes > 0 {
-		t.Run(fmt.Sprintf("%d/%d", *runMessages, *runNodes), testProxNetwork)
-		return
-	}
-	t.Run("1/32", testProxNetwork)
+func isDone() bool {
+	mu.Lock()
+	defer mu.Unlock()
+	return handlerDone
 }
 
-// This tests generates a sequenced number of messages with random addresses
-// It then calculates which nodes in the network have the address of each message within their nearest neighborhood depth, and stores them as recipients
-// Upon sending the messages, it verifies that the respective message is passed to the message handlers of these recipients
-// It will fail if a recipient handles a message it should not, or if after propagation not all expected messages are handled (timeout)
-func testProxNetwork(t *testing.T) {
+func setDone() {
+	mu.Lock()
+	defer mu.Unlock()
+	handlerDone = true
+}
 
+func TestSandbox(t *testing.T) {
+	if (*runNodes > 0 && *runMessages == 0) || (*runMessages > 0 && *runNodes == 0) {
+		t.Fatal("cannot specify only one of flags --nodes and --messages")
+	} else if *runNodes > 0 {
+		t.Run(fmt.Sprintf("%d/%d", *runMessages, *runNodes), testProxNetwork)
+	} else {
+		t.Run("1/4", testProxNetwork)
+	}
+}
+
+func getCmdParams(t *testing.T) (int, int) {
 	args := strings.Split(t.Name(), "/")
 	msgCount, err := strconv.ParseInt(args[1], 10, 16)
 	if err != nil {
@@ -80,59 +100,38 @@ func testProxNetwork(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	return int(msgCount), int(nodeCount)
+}
 
-	topic := BytesToTopic([]byte{0x00, 0x00, 0x06, 0x82})
-
-	// passes message from pss message handler to simulation driver
-	handlerC := make(chan handlerNotification)
-
-	// set to true on termination of the simulation run
-	var handlerDone bool
-
-	// keeps handlerDonc in sync
-	mu := &sync.Mutex{}
-
-	// message handler for pss
-	handlerContextFuncs := map[Topic]handlerContextFunc{
-		topic: func(ctx *adapters.NodeConfig) *handler {
-			return &handler{
-				f: func(msg []byte, p *p2p.Peer, asymmetric bool, keyid string) error {
-
-					// using simple serial in message body
-					// makes it easy to keep track of who's getting what
-					serial, c := binary.Uvarint(msg)
-					if c <= 0 {
-						t.Fatalf("corrupt message received by %x (uvarint parse returned %d)", ctx.ID, c)
-					}
-
-					// terminate if sim is over
-					mu.Lock()
-					if handlerDone {
-						mu.Unlock()
-						return errors.New("handlers aborted")
-					}
-					mu.Unlock()
-
-					// pass message context to the listener in the simulation
-					handlerC <- handlerNotification{
-						id:     ctx.ID,
-						serial: serial,
-					}
-					return nil
-				},
-				caps: &handlerCaps{
-					raw:  true, // we use raw messages for simplicity
-					prox: true,
-				},
+// message handler for pss
+func getHandler(ctx *adapters.NodeConfig) *handler {
+	return &handler{
+		f: func(msg []byte, p *p2p.Peer, asymmetric bool, keyid string) error {
+			// using simple serial in message body, makes it easy to keep track of who's getting what
+			serial, c := binary.Uvarint(msg)
+			if c <= 0 {
+				log.Crit(fmt.Sprintf("corrupt message received by %x (uvarint parse returned %d)", ctx.ID, c))
 			}
+
+			if isDone() {
+				return errors.New("handlers aborted") // terminate if simulation is over
+			}
+
+			// pass message context to the listener in the simulation
+			handlerC <- handlerNotification{
+				id:     ctx.ID,
+				serial: serial,
+			}
+			return nil
+		},
+		caps: &handlerCaps{
+			raw:  true, // we use raw messages for simplicity
+			prox: true,
 		},
 	}
+}
 
-	// TODO refactor swarm sim to enable access to kademlias from the sim obj
-	kademlias := make(map[enode.ID]*network.Kademlia)
-	sim := simulation.New(newProxServices(true, handlerContextFuncs, kademlias))
-	defer sim.Close()
-
+func readSnapshot(t *testing.T, nodeCount int) simulations.Snapshot {
 	f, err := os.Open(fmt.Sprintf("testdata/snapshot_%d.json", nodeCount))
 	if err != nil {
 		t.Fatal(err)
@@ -146,42 +145,15 @@ func testProxNetwork(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = sim.Net.Load(&snap)
-	if err != nil {
-		t.Fatal(err)
-	}
+	return snap
+}
 
-	// collect connection events up to expected number
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
-	defer cancel()
-
-	// make predictable overlay addresses from the generated random enode ids
-	nodeAddrs := make(map[enode.ID][]byte)
+func initTestVariables(sim *simulation.Simulation, msgCount int) {
 	for _, nodeId := range sim.NodeIDs() {
 		nodeAddrs[nodeId] = nodeIDToAddr(nodeId)
 	}
 
-	// generate messages and index them
-	pof := pot.DefaultPof(256)
-
-	// recipient addresses of messages
-	var msgs [][]byte
-
-	// for logging output only
-	recipients := make(map[int][]enode.ID)
-
-	// message serials we expect respective nodes to receive
-	expectedMsgs := make(map[enode.ID][]uint64)
-
-	// originating nodes of the messages
-	// intention is to choose as far as possible from the receiving neighborhood
-	senders := make(map[int]enode.ID)
-
-	// total count of messages to receive, used for terminating the simulation run
-	var msgsToReceive int
-
 	for i := 0; i < int(msgCount); i++ {
-
 		// we choose message addresses by random
 		msgAddr := pot.RandomAddress()
 		msgs = append(msgs, msgAddr.Bytes())
@@ -192,8 +164,7 @@ func testProxNetwork(t *testing.T) {
 			po, _ := pof(msgs[i], nodeAddrs[nod.ID()], 0)
 			depth := kademlias[nod.ID()].NeighbourhoodDepth()
 
-			// node has message address within nearest neighborhood depth
-			// that means it is a recipient
+			// node has message address within nearest neighborhood depth, that means it is a recipient
 			if po >= depth {
 				recipients[i] = append(recipients[i], nod.ID())
 				expectedMsgs[nod.ID()] = append(expectedMsgs[nod.ID()], uint64(i))
@@ -201,8 +172,7 @@ func testProxNetwork(t *testing.T) {
 			}
 
 			// keep track of the smallest po value in the iteration
-			// the first node in the smallest value bin
-			// will be the sender
+			// the first node in the smallest value bin will be the sender
 			if po < smallestPo {
 				smallestPo = po
 				senders[i] = nod.ID()
@@ -211,124 +181,114 @@ func testProxNetwork(t *testing.T) {
 		log.Debug("nn for msg", "rcptcount", len(recipients[i]), "msgidx", i, "msg", common.Bytes2Hex(msgs[i]), "sender", senders[i], "senderpo", smallestPo)
 	}
 	log.Debug("msgs to receive", "count", msgsToReceive)
+}
 
-	// simulation run function
-	runFunc := func(ctx context.Context, sim *simulation.Simulation) error {
-
-		// terminates the handler channel listener
-		doneC := make(chan struct{})
-
-		// error to pass to main sim thread
-		errC := make(chan error)
-
-		// message receipt notification to main sim thread
-		msgC := make(chan handlerNotification)
-
-		// handler channel listener
-		go func(errC chan error, doneC chan struct{}, msgC chan handlerNotification) {
-			for {
-				select {
-
-				// everything a-ok
-				case <-doneC:
-					mu.Lock()
-					handlerDone = true
-					mu.Unlock()
-					errC <- nil
-					return
-
-				// timeout or cancel
-				case <-ctx.Done():
-					mu.Lock()
-					handlerDone = true
-					mu.Unlock()
-					errC <- ctx.Err()
-					return
-
-				// incoming message from pss message handler
-				case handlerNotification := <-handlerC:
-
-				// for syntax brevity below
-					xMsgs := expectedMsgs[handlerNotification.id]
-
-				// check if recipient has already received all its messages and notify to fail the test if so
-					if len(xMsgs) == 0 {
-						mu.Lock()
-						handlerDone = true
-						mu.Unlock()
-						errC <- fmt.Errorf("too many messages received by recipient %x", handlerNotification.id)
-						return
-					}
-
-				// check if message serial is in expected messages for this recipient
-				// and notify to fail the test if not
-					idx := -1
-					for i, msg := range xMsgs {
-						if handlerNotification.serial == msg {
-							idx = i
-							break
-						}
-					}
-					if idx == -1 {
-						mu.Lock()
-						handlerDone = true
-						mu.Unlock()
-						errC <- fmt.Errorf("message %d received by wrong recipient %v", handlerNotification.serial, handlerNotification.id)
-						return
-					}
-
-				// message is ok, so remove that message serial from the recipient expectation array and notify the main sim thread
-					xMsgs[idx] = xMsgs[len(xMsgs)-1]
-					xMsgs = xMsgs[:len(xMsgs)-1]
-					msgC <- handlerNotification
-				}
-			}
-		}(errC, doneC, msgC)
-
-		time.Sleep(256 * time.Millisecond)
-
-		// send the messages
-		go func(msgs [][]byte, senders map[int]enode.ID, sim *simulation.Simulation) {
-			for i, msg := range msgs {
-				log.Debug("sending msg", "idx", i, "from", senders[i])
-				nodeClient, err := sim.Net.GetNode(senders[i]).Client()
-				if err != nil {
-					t.Fatal(err)
-				}
-				var uvarByte [8]byte
-				binary.PutUvarint(uvarByte[:], uint64(i))
-				nodeClient.Call(nil, "pss_sendRaw", hexutil.Encode(msg), hexutil.Encode(topic[:]), hexutil.Encode(uvarByte[:]))
-			}
-		}(msgs, senders, sim)
-
-		// collect incoming messages
-		// and terminate with corresponding status
-		// when message handler listener ends
-		msgsCountdown := msgsToReceive
-		cnt := 0
-		for {
-			select {
-			case err := <-errC:
-				return err
-			case hn := <-msgC:
-				cnt++
-				msgsCountdown--
-				log.Debug("msg received", "msgs_received", cnt, "total_expected", msgsToReceive, "id", hn.id, "serial", hn.serial)
-				if msgsCountdown == 0 {
-					close(doneC)
-				}
-			}
-		}
-
-		return nil
+// This tests generates a sequenced number of messages with random addresses.
+// It then calculates which nodes in the network have the address of each message
+// within their nearest neighborhood depth, and stores them as recipients.
+// Upon sending the messages, it verifies that the respective message is passed to the message handlers of these recipients.
+// It will fail if a recipient handles a message it should not, or if after propagation not all expected messages are handled (timeout)
+func testProxNetwork(t *testing.T) {
+	msgCount, nodeCount := getCmdParams(t)
+	handlerContextFuncs := make(map[Topic]handlerContextFunc)
+	handlerContextFuncs[topic] = getHandler
+	services := newProxServices(true, handlerContextFuncs, kademlias)
+	snap := readSnapshot(t, nodeCount)
+	sim = simulation.New(services)
+	defer sim.Close()
+	err := sim.Net.Load(&snap)
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	// run the sim
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+	defer cancel()
+	initTestVariables(sim, msgCount)
 	result := sim.Run(ctx, runFunc)
 	if result.Error != nil {
 		t.Fatal(result.Error)
 	}
 	t.Logf("completed %d", result.Duration)
+}
+
+func sendAllMsgs(msgs [][]byte, senders map[int]enode.ID, sim *simulation.Simulation) {
+	for i, msg := range msgs {
+		log.Debug("sending msg", "idx", i, "from", senders[i])
+		nodeClient, err := sim.Net.GetNode(senders[i]).Client()
+		if err != nil {
+			log.Crit(err.Error())
+		}
+		var uvarByte [8]byte
+		binary.PutUvarint(uvarByte[:], uint64(i))
+		nodeClient.Call(nil, "pss_sendRaw", hexutil.Encode(msg), hexutil.Encode(topic[:]), hexutil.Encode(uvarByte[:]))
+	}
+}
+
+func runFunc(ctx context.Context, sim *simulation.Simulation) error {
+	go handlerChannelListener(ctx, errC, doneC, msgC)
+	time.Sleep(64 * time.Millisecond)
+	go sendAllMsgs(msgs, senders, sim)
+	// collect incoming messages and terminate with corresponding status when message handler listener ends
+	msgsCountdown := msgsToReceive
+	cnt := 0
+	for {
+		select {
+		case err := <-errC:
+			return err
+		case hn := <-msgC:
+			cnt++
+			msgsCountdown--
+			log.Debug("msg received", "msgs_received", cnt, "total_expected", msgsToReceive, "id", hn.id, "serial", hn.serial)
+			if msgsCountdown == 0 {
+				close(doneC)
+			}
+		}
+	}
+	return nil
+}
+
+func handlerChannelListener(ctx context.Context, errC chan error, doneC chan struct{}, msgC chan handlerNotification) {
+	for {
+		select {
+		case <-doneC: // graceful exit
+			setDone()
+			errC <- nil
+			return
+
+		case <-ctx.Done(): // timeout or cancel
+			setDone()
+			errC <- ctx.Err()
+			return
+
+		// incoming message from pss message handler
+		case handlerNotification := <-handlerC:
+			// check if recipient has already received all its messages and notify to fail the test if so
+			xMsgs := expectedMsgs[handlerNotification.id]
+			if len(xMsgs) == 0 {
+				setDone()
+				errC <- fmt.Errorf("too many messages received by recipient %x", handlerNotification.id)
+				return
+			}
+
+			// check if message serial is in expected messages for this recipient and notify to fail the test if not
+			idx := -1
+			for i, msg := range xMsgs {
+				if handlerNotification.serial == msg {
+					idx = i
+					break
+				}
+			}
+			if idx == -1 {
+				setDone()
+				errC <- fmt.Errorf("message %d received by wrong recipient %v", handlerNotification.serial, handlerNotification.id)
+				return
+			}
+
+			// message is ok, so remove that message serial from the recipient expectation array and notify the main sim thread
+			xMsgs[idx] = xMsgs[len(xMsgs)-1]
+			xMsgs = xMsgs[:len(xMsgs)-1]
+			msgC <- handlerNotification
+		}
+	}
 }
 
 // an adaptation of the same services setup as in pss_test.go
@@ -426,11 +386,8 @@ func nodeIDToAddr(id enode.ID) []byte {
 func serenityNowPlease(sim *simulation.Simulation, serenity time.Duration, timeout time.Duration) bool {
 	ctx, cancel := context.WithTimeout(context.TODO(), timeout)
 	defer cancel()
-
 	eventFilter := simulation.NewPeerEventsFilter().Connect().Drop()
-
 	eventC := sim.PeerEvents(ctx, sim.NodeIDs(), eventFilter)
-
 	timer := time.NewTimer(serenity)
 	for {
 		select {
@@ -443,4 +400,3 @@ func serenityNowPlease(sim *simulation.Simulation, serenity time.Duration, timeo
 		}
 	}
 }
-*/
