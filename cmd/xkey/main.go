@@ -128,6 +128,9 @@ func secureInputWithConfirmations(confirmations int) []byte {
 	s := terminal.SecureInput(extended)
 	for i := 0; i < confirmations; i++ {
 		fmt.Print("Please confirm: ")
+		if !plaintext {
+			fmt.Println()
+		}
 		x := terminal.SecureInput(extended)
 		if !bytes.Equal(s, x) {
 			fmt.Printf("Failed confirmation #%d. Let's try again from scratch.\n", i)
