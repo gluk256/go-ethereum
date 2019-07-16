@@ -22,54 +22,47 @@ import (
 )
 
 var (
-	txFromFile bool
-	eip155     bool
-	brainSrc   bool
-	extended   bool
-	plaintext  bool
+	txFromFile   bool
+	eip155       bool
+	brainSrc     bool
+	extended     bool
+	plaintext    bool
+	saveSignedTx bool
 )
 
 func main() {
 	if len(os.Args) > 1 {
-		flags := os.Args[1]
-		if strings.Contains(flags, "h") {
-			help()
-			return
-		}
-		if strings.Contains(flags, "?") {
-			help()
-			return
-		}
-		if strings.Contains(flags, "t") {
-			test()
-			return
-		}
-		if strings.Contains(flags, "i") {
-			ImportBrainWallet()
-			return
-		}
-
-		if strings.Contains(flags, "x") {
-			extended = true
-		}
-		if strings.Contains(flags, "n") {
-			eip155 = true
-		}
-		if strings.Contains(flags, "f") {
-			txFromFile = true
-		}
-		if strings.Contains(flags, "b") {
-			brainSrc = true
-		}
-		if strings.Contains(flags, "p") {
-			plaintext = confirmPlainTextMode()
-		}
+		processFlags(os.Args[1])
 	}
 	run()
 }
 
+func processFlags(flags string) {
+	if strings.Contains(flags, "h") || strings.Contains(flags, "?") {
+		help()
+		os.Exit(0)
+	}
+	if strings.Contains(flags, "t") {
+		test()
+		os.Exit(0)
+	}
+	if strings.Contains(flags, "i") {
+		ImportBrainWallet()
+		os.Exit(0)
+	}
+
+	extended = strings.Contains(flags, "x")
+	eip155 = strings.Contains(flags, "n")
+	txFromFile = strings.Contains(flags, "f")
+	brainSrc = strings.Contains(flags, "b")
+	saveSignedTx = strings.Contains(flags, "s")
+	if strings.Contains(flags, "p") {
+		plaintext = confirmPlainTextMode()
+	}
+}
+
 func help() {
-	fmt.Println("xkey v.0.3")
+	fmt.Println("xkey v.0.4")
 	fmt.Println("USAGE: xkey [flags]")
 	fmt.Println("\t h - help")
 	fmt.Println("\t i - import brainwallet")
@@ -78,6 +71,7 @@ func help() {
 	fmt.Println("\t f - tx from file")
 	fmt.Println("\t x - extended input")
 	fmt.Println("\t p - plaintext input")
+	fmt.Println("\t s - save signed tx to file")
 	fmt.Println("\t t - test")
 }
 
@@ -124,14 +118,23 @@ func getSigner() types.Signer {
 	}
 }
 
+func checkInputValidity(s []byte) {
+	if len(s) < 2 {
+		fmt.Println("User requested exit.")
+		os.Exit(0)
+	}
+}
+
 func secureInputWithConfirmations(confirmations int) []byte {
 	s := terminal.SecureInput(extended)
+	checkInputValidity(s)
 	for i := 0; i < confirmations; i++ {
 		fmt.Print("Please confirm: ")
 		if !plaintext {
 			fmt.Println()
 		}
 		x := terminal.SecureInput(extended)
+		checkInputValidity(x)
 		if !bytes.Equal(s, x) {
 			fmt.Printf("Failed confirmation #%d. Let's try again from scratch.\n", i)
 			return nil
@@ -143,12 +146,17 @@ func secureInputWithConfirmations(confirmations int) []byte {
 func ImportBrainWallet() {
 	c := getInt("Please enter the number of BW confirmations: ")
 	key := bip39toKey(c)
-
+	fmt.Printf("new address: %x \n", key.Address)
 	c = getInt("Please enter the number of password confirmations: ")
 	fmt.Println("Please enter the password for key encryption")
+
 	var pass []byte
-	for pass == nil {
+	for j := 0; pass == nil; j++ {
 		pass = secureInputWithConfirmations(c)
+		if j >= 3 {
+			fmt.Println("Failed after three retries. Exit.")
+			return
+		}
 	}
 
 	keyjson, err := keystore.EncryptKey(key, string(pass), keystore.StandardScryptN, keystore.StandardScryptP)
@@ -156,63 +164,35 @@ func ImportBrainWallet() {
 		utils.Fatalf("Error encrypting key: %v", err)
 	}
 
-	// store the file to disk
-	rnd := make([]byte, 16)
-	err = crutils.StochasticRand(rnd)
-	if err != nil {
-		utils.Fatalf("Failed to generate random data: %s", err)
-	}
+	prefix := fmt.Sprintf("%x", key.Address)
+	serializeContent(prefix, keyjson)
+}
 
-	name := fmt.Sprintf("./tmp/%x-%x", key.Address, rnd)
-	_, err = os.Stat(name)
+func serializeContent(prefix string, content []byte) {
+	rnd := make([]byte, 16)
+	crutils.Randomize(rnd)
+	name := fmt.Sprintf("./%s-%x", prefix, rnd)
+	_, err := os.Stat(name)
 	if !os.IsNotExist(err) {
 		utils.Fatalf("Unexpected error: file [%s] already exist", name)
 	}
 
-	if err := ioutil.WriteFile(name, keyjson, 0666); err != nil {
+	if err := ioutil.WriteFile(name, content, 0666); err != nil {
 		utils.Fatalf("Failed to write keyfile to [%s]: %v", name, err)
 	}
 
-	fmt.Printf("new address: %x \n", key.Address)
-	fmt.Println("key file: ", name)
+	fmt.Println("saved result to file: ", name)
 }
-
-// do not delete
-//func findFileByAddress(src common.Address) string {
-//	address := fmt.Sprintf("%x", src)
-//	usr, err := user.Current()
-//	if err != nil {
-//		utils.Fatalf("can not find current user: %s", err)
-//	}
-//	dir := usr.HomeDir + "/.ethereum/keystore/"
-//	files, err := ioutil.ReadDir(dir)
-//	if err != nil {
-//		utils.Fatalf("can not read directory: %s", err)
-//	}
-//
-//	for _, f := range files {
-//		if strings.Contains(f.Name(), address) {
-//			return dir + f.Name()
-//		}
-//	}
-//
-//	fmt.Println("key file not found, please enter file name:")
-//	name := terminal.PlainTextInput()
-//	if len(name) == 0 {
-//		utils.Fatalf("key file is missing")
-//	}
-//	return string(name)
-//}
 
 func checkTxParams(args *ethapi.SendTxArgs) {
 	if args.Nonce == nil {
-		utils.Fatalf("Invalid tx: nonce is nil")
+		utils.Fatalf("Invalid tx: nonce is missing")
 	}
 	if args.To == nil {
-		utils.Fatalf("Invalid tx: [to] is nil")
+		utils.Fatalf("Invalid tx: [to] is missing")
 	}
 	if args.Gas == nil {
-		utils.Fatalf("Invalid tx: gas is nil")
+		utils.Fatalf("Invalid tx: gas is missing")
 	}
 }
 
@@ -275,8 +255,12 @@ func getPassword() string {
 
 func bip39toKey(confirmations int) *keystore.Key {
 	var brainwallet []byte
-	for brainwallet == nil {
+	for j := 0; brainwallet == nil; j++ {
 		brainwallet = secureInputWithConfirmations(confirmations)
+		if j >= 3 {
+			fmt.Println("Failed after three retries. Exit.")
+			os.Exit(0)
+		}
 	}
 	hash := crutils.Sha2(brainwallet)
 	privateKey, err := crypto.ToECDSA(hash)
@@ -333,9 +317,44 @@ func run() {
 		utils.Fatalf("EncodeRLP error: %s", err)
 	}
 
-	fmt.Printf("%x\n", res)
+	outputTx(res)
+}
+
+func outputTx(res []byte) {
+	s := fmt.Sprintf("%x\n", res)
+	fmt.Print(s)
+	if saveSignedTx {
+		serializeContent("tx", []byte(s))
+	}
 }
 
 func test() {
 	fmt.Println("test success")
 }
+
+// do not delete!
+//func findFileByAddress(src common.Address) string {
+//	address := fmt.Sprintf("%x", src)
+//	usr, err := user.Current()
+//	if err != nil {
+//		utils.Fatalf("can not find current user: %s", err)
+//	}
+//	dir := usr.HomeDir + "/.ethereum/keystore/"
+//	files, err := ioutil.ReadDir(dir)
+//	if err != nil {
+//		utils.Fatalf("can not read directory: %s", err)
+//	}
+//
+//	for _, f := range files {
+//		if strings.Contains(f.Name(), address) {
+//			return dir + f.Name()
+//		}
+//	}
+//
+//	fmt.Println("key file not found, please enter file name:")
+//	name := terminal.PlainTextInput()
+//	if len(name) == 0 {
+//		utils.Fatalf("key file is missing")
+//	}
+//	return string(name)
+//}
