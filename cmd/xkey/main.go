@@ -169,12 +169,15 @@ func ImportBrainWallet() {
 }
 
 func serializeContent(prefix string, content []byte) {
-	rnd := make([]byte, 16)
-	crutils.Randomize(rnd)
-	name := fmt.Sprintf("./%s-%x", prefix, rnd)
-	_, err := os.Stat(name)
-	if !os.IsNotExist(err) {
-		utils.Fatalf("Unexpected error: file [%s] already exist", name)
+	var name string
+	for i := 0; i < 1024; i++ {
+		rnd := make([]byte, 4)
+		crutils.Randomize(rnd)
+		name = fmt.Sprintf("./%s-%x", prefix, rnd)
+		_, err := os.Stat(name)
+		if os.IsNotExist(err) {
+			break
+		}
 	}
 
 	if err := ioutil.WriteFile(name, content, 0666); err != nil {
@@ -193,6 +196,12 @@ func checkTxParams(args *ethapi.SendTxArgs) {
 	}
 	if args.Gas == nil {
 		utils.Fatalf("Invalid tx: gas is missing")
+	}
+	if args.GasPrice == nil {
+		utils.Fatalf("Invalid tx: gas price is missing")
+	}
+	if args.Value == nil {
+		utils.Fatalf("Invalid tx: value is missing")
 	}
 }
 
@@ -307,20 +316,20 @@ func run() {
 	tx := getTransaction()
 	key := getKey()
 
-	signedTX, err := types.SignTx(tx, signer, key.PrivateKey)
+	signedTx, err := types.SignTx(tx, signer, key.PrivateKey)
 	if err != nil {
 		utils.Fatalf("Signing error: %s", err)
 	}
 
-	res, err := rlp.EncodeToBytes(signedTX)
+	res, err := rlp.EncodeToBytes(signedTx)
 	if err != nil {
 		utils.Fatalf("EncodeRLP error: %s", err)
 	}
 
-	outputTx(res)
+	publishSinedTx(res)
 }
 
-func outputTx(res []byte) {
+func publishSinedTx(res []byte) {
 	s := fmt.Sprintf("%x\n", res)
 	fmt.Print(s)
 	if saveSignedTx {
