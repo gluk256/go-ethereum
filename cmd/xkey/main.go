@@ -41,11 +41,13 @@ func annihilateBigInt(i *big.Int) {
 }
 
 func annihilateKey(k *keystore.Key) {
-	annihilateBigInt(k.PrivateKey.D)
-	annihilateBigInt(k.PrivateKey.X)
-	annihilateBigInt(k.PrivateKey.Y)
-	crutils.AnnihilateData(k.Address[:])
-	crutils.AnnihilateData(k.Id)
+	if k != nil {
+		annihilateBigInt(k.PrivateKey.D)
+		annihilateBigInt(k.PrivateKey.X)
+		annihilateBigInt(k.PrivateKey.Y)
+		crutils.AnnihilateData(k.Address[:])
+		crutils.AnnihilateData(k.Id)
+	}
 }
 
 func main() {
