@@ -10,8 +10,6 @@ import (
 	"strings"
 
 	"github.com/ethereum/go-ethereum/accounts/keystore"
-	"github.com/ethereum/go-ethereum/cmd/utils"
-	"github.com/ethereum/go-ethereum/console"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/internal/ethapi"
@@ -30,25 +28,50 @@ var (
 	saveSignedTx bool
 )
 
+func annihilateBigInt(i *big.Int) {
+	arr := i.Bits()
+	sz := len(arr)
+	for i := sz - 1; i >= 0; i-- {
+		u, _ := crutils.StochasticUint64() // ignore the errors
+		arr[i] ^= big.Word(u)
+	}
+	for i := 0; i < sz; i++ {
+		crutils.RecordDestruction(uint64(arr[i]))
+	}
+}
+
+func annihilateKey(k *keystore.Key) {
+	annihilateBigInt(k.PrivateKey.D)
+	annihilateBigInt(k.PrivateKey.X)
+	annihilateBigInt(k.PrivateKey.Y)
+	crutils.AnnihilateData(k.Address[:])
+	crutils.AnnihilateData(k.Id)
+}
+
 func main() {
+	defer crutils.ProveDataDestruction()
 	if len(os.Args) > 1 {
-		processFlags(os.Args[1])
+		done := processFlags(os.Args[1])
+		if done {
+			return
+		}
 	}
 	run()
 }
 
-func processFlags(flags string) {
+// returns true if execution is complete
+func processFlags(flags string) bool {
 	if strings.Contains(flags, "h") || strings.Contains(flags, "?") {
 		help()
-		os.Exit(0)
+		return true
 	}
 	if strings.Contains(flags, "t") {
 		test()
-		os.Exit(0)
+		return true
 	}
 	if strings.Contains(flags, "i") {
 		ImportBrainWallet()
-		os.Exit(0)
+		return true
 	}
 
 	extended = strings.Contains(flags, "x")
@@ -59,10 +82,11 @@ func processFlags(flags string) {
 	if strings.Contains(flags, "p") {
 		plaintext = confirmPlainTextMode()
 	}
+	return false
 }
 
 func help() {
-	fmt.Println("xkey v.0.4")
+	fmt.Println("xkey v.0.5")
 	fmt.Println("USAGE: xkey [flags]")
 	fmt.Println("\t h - help")
 	fmt.Println("\t i - import brainwallet")
@@ -118,24 +142,32 @@ func getSigner() types.Signer {
 	}
 }
 
-func checkInputValidity(s []byte) {
+func isInputValid(s []byte) bool {
 	if len(s) < 2 {
 		fmt.Println("User requested exit.")
-		os.Exit(0)
+		return false
 	}
+	if len(s) < 12 {
+		fmt.Println("Warning: password is too short!")
+	}
+	return true
 }
 
 func secureInputWithConfirmations(confirmations int) []byte {
 	s := terminal.SecureInput(extended)
-	checkInputValidity(s)
+	if !isInputValid(s) {
+		return nil
+	}
 	for i := 0; i < confirmations; i++ {
 		fmt.Print("Please confirm: ")
 		if !plaintext {
 			fmt.Println()
 		}
 		x := terminal.SecureInput(extended)
-		checkInputValidity(x)
-		if !bytes.Equal(s, x) {
+		valid := isInputValid(x)
+		equal := bytes.Equal(s, x)
+		crutils.AnnihilateData(x)
+		if !valid || !equal {
 			fmt.Printf("Failed confirmation #%d. Let's try again from scratch.\n", i)
 			return nil
 		}
@@ -146,11 +178,13 @@ func secureInputWithConfirmations(confirmations int) []byte {
 func ImportBrainWallet() {
 	c := getInt("Please enter the number of BW confirmations: ")
 	key := bip39toKey(c)
+	defer annihilateKey(key)
 	fmt.Printf("new address: %x \n", key.Address)
 	c = getInt("Please enter the number of password confirmations: ")
 	fmt.Println("Please enter the password for key encryption")
 
 	var pass []byte
+	defer crutils.AnnihilateData(pass)
 	for j := 0; pass == nil; j++ {
 		pass = secureInputWithConfirmations(c)
 		if j >= 3 {
@@ -161,7 +195,8 @@ func ImportBrainWallet() {
 
 	keyjson, err := keystore.EncryptKey(key, string(pass), keystore.StandardScryptN, keystore.StandardScryptP)
 	if err != nil {
-		utils.Fatalf("Error encrypting key: %v", err)
+		fmt.Printf("Error encrypting key: %s\n", err.Error())
+		return
 	}
 
 	prefix := fmt.Sprintf("%x", key.Address)
@@ -180,33 +215,42 @@ func serializeContent(prefix string, content []byte) {
 		}
 	}
 
-	if err := ioutil.WriteFile(name, content, 0666); err != nil {
-		utils.Fatalf("Failed to write keyfile to [%s]: %v", name, err)
+	err := ioutil.WriteFile(name, content, 0666)
+	if err == nil {
+		fmt.Println("saved result to the file: ", name)
+	} else {
+		fmt.Printf("Failed to write keyfile to [%s]: %s\n", name, err.Error())
 	}
-
-	fmt.Println("saved result to file: ", name)
 }
 
-func checkTxParams(args *ethapi.SendTxArgs) {
+func checkTxParams(args *ethapi.SendTxArgs) bool {
 	if args.Nonce == nil {
-		utils.Fatalf("Invalid tx: nonce is missing")
+		fmt.Printf("Invalid tx: nonce is missing\n")
+		return false
 	}
 	if args.To == nil {
-		utils.Fatalf("Invalid tx: [to] is missing")
+		fmt.Printf("Invalid tx: [to] is missing\n")
+		return false
 	}
 	if args.Gas == nil {
-		utils.Fatalf("Invalid tx: gas is missing")
+		fmt.Printf("Invalid tx: gas is missing\n")
+		return false
 	}
 	if args.GasPrice == nil {
-		utils.Fatalf("Invalid tx: gas price is missing")
+		fmt.Printf("Invalid tx: gas price is missing\n")
+		return false
 	}
 	if args.Value == nil {
-		utils.Fatalf("Invalid tx: value is missing")
+		fmt.Printf("Invalid tx: value is missing\n")
+		return false
 	}
+	return true
 }
 
 func createTransaction(args *ethapi.SendTxArgs) *types.Transaction {
-	checkTxParams(args)
+	if !checkTxParams(args) {
+		return nil
+	}
 	var input []byte
 	if args.Data != nil {
 		input = *args.Data
@@ -226,7 +270,8 @@ func requestTransaction() *ethapi.SendTxArgs {
 		fname := getString("Please enter tx file name: ")
 		tb, err = ioutil.ReadFile(fname)
 		if err != nil {
-			utils.Fatalf("Failed to read the tx file [%s]: %v", fname, err)
+			fmt.Printf("Failed to read the tx file [%s]: %s\n", fname, err.Error())
+			return nil
 		}
 	} else {
 		ts := getString("Please enter tx for signing: ")
@@ -235,7 +280,8 @@ func requestTransaction() *ethapi.SendTxArgs {
 
 	var txArgs ethapi.SendTxArgs
 	if err = json.Unmarshal(tb, &txArgs); err != nil {
-		utils.Fatalf("tx unmarshal failed: %s", err)
+		fmt.Printf("tx unmarshal failed: %s\n", err)
+		return nil
 	}
 	if txArgs.Input == nil && txArgs.Data != nil {
 		txArgs.Input = txArgs.Data
@@ -243,38 +289,39 @@ func requestTransaction() *ethapi.SendTxArgs {
 	return &txArgs
 }
 
-func getTransaction() *types.Transaction {
+func getTransaction() (tx *types.Transaction) {
 	txArgs := requestTransaction()
-	tx := createTransaction(txArgs)
+	if txArgs != nil {
+		tx = createTransaction(txArgs)
+	}
 	return tx
 }
 
-func getPassword() string {
+func getPassword() (p []byte) {
 	if plaintext {
-		pass, err := console.Stdin.PromptPassword("Please enter password: ")
-		if err != nil {
-			utils.Fatalf("Failed to read passphrase: %v", err)
-		}
-		return pass
+		p = terminal.PasswordModeInput()
+	} else {
+		p = terminal.SecureInput(extended)
 	}
-
-	p := terminal.SecureInput(extended)
-	return string(p)
+	return p
 }
 
 func bip39toKey(confirmations int) *keystore.Key {
 	var brainwallet []byte
+	defer crutils.AnnihilateData(brainwallet)
 	for j := 0; brainwallet == nil; j++ {
 		brainwallet = secureInputWithConfirmations(confirmations)
 		if j >= 3 {
 			fmt.Println("Failed after three retries. Exit.")
-			os.Exit(0)
+			return nil
 		}
 	}
 	hash := crutils.Sha2(brainwallet)
+	defer crutils.AnnihilateData(hash)
 	privateKey, err := crypto.ToECDSA(hash)
 	if err != nil {
-		utils.Fatalf("brain wallet derivation error: %v", err)
+		fmt.Printf("failed to derive the wallet: %s\n", err.Error())
+		return nil
 	}
 
 	id := uuid.NewRandom()
@@ -292,13 +339,16 @@ func getKeyFromFile() *keystore.Key {
 	keyfile := getString("Please enter the key file name: ")
 	keyjson, err := ioutil.ReadFile(keyfile)
 	if err != nil {
-		utils.Fatalf("Failed to read the keyfile at '%s': %v", keyfile, err)
+		fmt.Printf("Failed to read the keyfile at '%s': %s\n", keyfile, err.Error())
+		return nil
 	}
 
-	passphrase := getPassword()
-	key, err := keystore.DecryptKey(keyjson, string(passphrase))
+	pass := getPassword()
+	defer crutils.AnnihilateData(pass)
+	key, err := keystore.DecryptKey(keyjson, string(pass))
 	if err != nil {
-		utils.Fatalf("Error decrypting key: %v", err)
+		fmt.Printf("Error decrypting key: %s\n", err.Error())
+		return nil
 	}
 	return key
 }
@@ -314,16 +364,26 @@ func getKey() *keystore.Key {
 func run() {
 	signer := getSigner()
 	tx := getTransaction()
+	if tx == nil {
+		return
+	}
+
 	key := getKey()
+	defer annihilateKey(key)
+	if key == nil {
+		return
+	}
 
 	signedTx, err := types.SignTx(tx, signer, key.PrivateKey)
 	if err != nil {
-		utils.Fatalf("Signing error: %s", err)
+		fmt.Printf("Signing error: %s\n", err.Error())
+		return
 	}
 
 	res, err := rlp.EncodeToBytes(signedTx)
 	if err != nil {
-		utils.Fatalf("EncodeRLP error: %s", err)
+		fmt.Printf("EncodeRLP error: %s\n", err.Error())
+		return
 	}
 
 	publishSinedTx(res)
@@ -342,28 +402,29 @@ func test() {
 }
 
 // do not delete!
-//func findFileByAddress(src common.Address) string {
-//	address := fmt.Sprintf("%x", src)
-//	usr, err := user.Current()
-//	if err != nil {
-//		utils.Fatalf("can not find current user: %s", err)
-//	}
-//	dir := usr.HomeDir + "/.ethereum/keystore/"
-//	files, err := ioutil.ReadDir(dir)
-//	if err != nil {
-//		utils.Fatalf("can not read directory: %s", err)
-//	}
-//
-//	for _, f := range files {
-//		if strings.Contains(f.Name(), address) {
-//			return dir + f.Name()
-//		}
-//	}
-//
-//	fmt.Println("key file not found, please enter file name:")
-//	name := terminal.PlainTextInput()
-//	if len(name) == 0 {
-//		utils.Fatalf("key file is missing")
-//	}
-//	return string(name)
-//}
+// func findFileByAddress(src common.Address) string {
+// 	address := fmt.Sprintf("%x", src)
+// 	usr, err := user.Current()
+// 	if err != nil {
+// 		fmt.Printf("can not find current user: %s\n", err.Error())
+// 		return "FileNotFound"
+// 	}
+// 	dir := usr.HomeDir + "/.ethereum/keystore/"
+// 	files, err := ioutil.ReadDir(dir)
+// 	if err != nil {
+// 		fmt.Printf("can not read directory: %s\n", err.Error())
+// 		return "FileNotFound"
+// 	}
+// 	for _, f := range files {
+// 		if strings.Contains(f.Name(), address) {
+// 			return dir + f.Name()
+// 		}
+// 	}
+// 	fmt.Println("key file not found, please enter file name:")
+// 	name := terminal.PlainTextInput()
+// 	if len(name) == 0 {
+// 		fmt.Println("key file is missing")
+// 		return "FileNotFound"
+// 	}
+// 	return string(name)
+// }
