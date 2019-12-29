@@ -14,6 +14,7 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/internal/ethapi"
 	"github.com/ethereum/go-ethereum/rlp"
+	"github.com/gluk256/crypto/asym"
 	"github.com/gluk256/crypto/crutils"
 	"github.com/gluk256/crypto/terminal"
 	"github.com/pborman/uuid"
@@ -27,28 +28,6 @@ var (
 	plaintext    bool
 	saveSignedTx bool
 )
-
-func annihilateBigInt(i *big.Int) {
-	arr := i.Bits()
-	sz := len(arr)
-	for i := sz - 1; i >= 0; i-- {
-		u, _ := crutils.StochasticUint64() // ignore the errors
-		arr[i] ^= big.Word(u)
-	}
-	for i := 0; i < sz; i++ {
-		crutils.RecordDestruction(uint64(arr[i]))
-	}
-}
-
-func annihilateKey(k *keystore.Key) {
-	if k != nil {
-		annihilateBigInt(k.PrivateKey.D)
-		annihilateBigInt(k.PrivateKey.X)
-		annihilateBigInt(k.PrivateKey.Y)
-		crutils.AnnihilateData(k.Address[:])
-		crutils.AnnihilateData(k.Id)
-	}
-}
 
 func main() {
 	defer crutils.ProveDataDestruction()
@@ -180,7 +159,7 @@ func secureInputWithConfirmations(confirmations int) []byte {
 func ImportBrainWallet() {
 	c := getInt("Please enter the number of BW confirmations: ")
 	key := bip39toKey(c)
-	defer annihilateKey(key)
+	defer asym.AnnihilatePrivateKey(key.PrivateKey)
 	fmt.Printf("new address: %x \n", key.Address)
 	c = getInt("Please enter the number of password confirmations: ")
 	fmt.Println("Please enter the password for key encryption")
@@ -371,7 +350,7 @@ func run() {
 	}
 
 	key := getKey()
-	defer annihilateKey(key)
+	defer asym.AnnihilatePrivateKey(key.PrivateKey)
 	if key == nil {
 		return
 	}
