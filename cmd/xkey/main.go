@@ -134,11 +134,9 @@ func isInputValid(s []byte) bool {
 }
 
 func ImportBrainWallet() {
-	c := getInt("Please enter the number of BW confirmations: ")
-	key := bip39toKey(c)
+	key := bip39toKey()
 	defer asym.AnnihilatePrivateKey(key.PrivateKey)
 	fmt.Printf("new address: %x \n", key.Address)
-	c = getInt("Please enter the number of password confirmations: ")
 	fmt.Println("Please enter the password for key encryption")
 
 	pass := getPassword()
@@ -261,7 +259,7 @@ func getPassword() (p []byte) {
 	return p
 }
 
-func bip39toKey(confirmations int) *keystore.Key {
+func bip39toKey() *keystore.Key {
 	brainwallet := getPassword()
 	defer crutils.AnnihilateData(brainwallet)
 	if len(brainwallet) < 2 {
@@ -308,7 +306,7 @@ func getKeyFromFile() *keystore.Key {
 
 func getKey() *keystore.Key {
 	if brainSrc {
-		return bip39toKey(0)
+		return bip39toKey()
 	} else {
 		return getKeyFromFile()
 	}
