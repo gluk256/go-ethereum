@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -14,9 +13,9 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/internal/ethapi"
 	"github.com/ethereum/go-ethereum/rlp"
-	"github.com/gluk256/crypto/asym"
 	"github.com/gluk256/crypto/crutils"
 	"github.com/gluk256/crypto/terminal"
+	"github.com/gluk256/elliptic/asym"
 	"github.com/pborman/uuid"
 )
 
@@ -25,7 +24,7 @@ var (
 	eip155       bool
 	brainSrc     bool
 	extended     bool
-	plaintext    bool
+	passwordMode bool
 	saveSignedTx bool
 )
 
@@ -61,13 +60,13 @@ func processFlags(flags string) bool {
 	brainSrc = strings.Contains(flags, "b")
 	saveSignedTx = strings.Contains(flags, "s")
 	if strings.Contains(flags, "p") {
-		plaintext = confirmPlainTextMode()
+		passwordMode = confirmPlainTextMode()
 	}
 	return false
 }
 
 func help() {
-	fmt.Println("xkey v.0.5")
+	fmt.Println("xkey v.0.6")
 	fmt.Println("USAGE: xkey [flags]")
 	fmt.Println("\t h - help")
 	fmt.Println("\t i - import brainwallet")
@@ -75,7 +74,7 @@ func help() {
 	fmt.Println("\t n - use network id")
 	fmt.Println("\t f - tx from file")
 	fmt.Println("\t x - extended input")
-	fmt.Println("\t p - plaintext input")
+	fmt.Println("\t p - password mode input")
 	fmt.Println("\t s - save signed tx to file")
 	fmt.Println("\t t - test")
 }
@@ -134,28 +133,6 @@ func isInputValid(s []byte) bool {
 	return true
 }
 
-func secureInputWithConfirmations(confirmations int) []byte {
-	s := terminal.SecureInput(extended)
-	if !isInputValid(s) {
-		return nil
-	}
-	for i := 0; i < confirmations; i++ {
-		fmt.Print("Please confirm: ")
-		if !plaintext {
-			fmt.Println()
-		}
-		x := terminal.SecureInput(extended)
-		valid := isInputValid(x)
-		equal := bytes.Equal(s, x)
-		crutils.AnnihilateData(x)
-		if !valid || !equal {
-			fmt.Printf("Failed confirmation #%d. Let's try again from scratch.\n", i)
-			return nil
-		}
-	}
-	return s
-}
-
 func ImportBrainWallet() {
 	c := getInt("Please enter the number of BW confirmations: ")
 	key := bip39toKey(c)
@@ -164,14 +141,11 @@ func ImportBrainWallet() {
 	c = getInt("Please enter the number of password confirmations: ")
 	fmt.Println("Please enter the password for key encryption")
 
-	var pass []byte
+	pass := getPassword()
 	defer crutils.AnnihilateData(pass)
-	for j := 0; pass == nil; j++ {
-		pass = secureInputWithConfirmations(c)
-		if j >= 3 {
-			fmt.Println("Failed after three retries. Exit.")
-			return
-		}
+	if len(pass) < 2 {
+		fmt.Println("Error: the key is too short. Exit.")
+		return
 	}
 
 	keyjson, err := keystore.EncryptKey(key, string(pass), keystore.StandardScryptN, keystore.StandardScryptP)
@@ -279,7 +253,7 @@ func getTransaction() (tx *types.Transaction) {
 }
 
 func getPassword() (p []byte) {
-	if plaintext {
+	if passwordMode {
 		p = terminal.PasswordModeInput()
 	} else {
 		p = terminal.SecureInput(extended)
@@ -288,20 +262,18 @@ func getPassword() (p []byte) {
 }
 
 func bip39toKey(confirmations int) *keystore.Key {
-	var brainwallet []byte
+	brainwallet := getPassword()
 	defer crutils.AnnihilateData(brainwallet)
-	for j := 0; brainwallet == nil; j++ {
-		brainwallet = secureInputWithConfirmations(confirmations)
-		if j >= 3 {
-			fmt.Println("Failed after three retries. Exit.")
-			return nil
-		}
+	if len(brainwallet) < 2 {
+		fmt.Println("Error: the key is too short. Exit.")
+		return nil
 	}
+
 	hash := crutils.Sha2(brainwallet)
 	defer crutils.AnnihilateData(hash)
 	privateKey, err := crypto.ToECDSA(hash)
 	if err != nil {
-		fmt.Printf("failed to derive the wallet: %s\n", err.Error())
+		fmt.Printf("Error: failed to derive the wallet: %s\n", err.Error())
 		return nil
 	}
 
