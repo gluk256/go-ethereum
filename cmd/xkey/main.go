@@ -252,6 +252,7 @@ func getTransaction() (tx *types.Transaction) {
 
 func getPassword() (p []byte) {
 	if passwordMode {
+		fmt.Print("Please enter the key: ")
 		p = terminal.PasswordModeInput()
 	} else {
 		p = terminal.SecureInput(extended)
@@ -320,11 +321,11 @@ func run() {
 	}
 
 	key := getKey()
-	defer asym.AnnihilatePrivateKey(key.PrivateKey)
 	if key == nil {
 		return
 	}
 
+	defer asym.AnnihilatePrivateKey(key.PrivateKey)
 	signedTx, err := types.SignTx(tx, signer, key.PrivateKey)
 	if err != nil {
 		fmt.Printf("Signing error: %s\n", err.Error())
@@ -338,6 +339,7 @@ func run() {
 	}
 
 	publishSinedTx(res)
+	fmt.Printf("Signing address: %x \n", key.Address)
 }
 
 func publishSinedTx(res []byte) {
@@ -349,7 +351,7 @@ func publishSinedTx(res []byte) {
 }
 
 func test() {
-	fmt.Println("test success")
+	fmt.Println("Test success")
 }
 
 // do not delete!
